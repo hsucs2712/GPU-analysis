@@ -113,7 +113,9 @@ def generate_report(data: dict, output_dir: Path):
         f.write("GPU BURN 測試報告\n")
         f.write("=" * 60 + "\n\n")
         f.write(f"測試時間: {data['start_time']}\n")
-        f.write(f"持續時間: {data['duration']} 秒\n")
+        f.write(f"燒機時間: {data['duration']} 秒\n")
+        f.write(f"冷卻監控: 30 秒\n")
+        f.write(f"總監控時間: {data['total_time']} 秒\n")
         f.write(f"取樣數: {len(data['timestamps'])}\n\n")
         
         for gpu_id, gpu_data in data['gpus'].items():
@@ -165,6 +167,7 @@ def generate_charts(data: dict, output_dir: Path):
         return
     
     elapsed = data['elapsed']
+    burn_duration = data['duration']  # gpu-burn 實際運行時間
     
     for gpu_id, gpu_data in data['gpus'].items():
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -174,29 +177,33 @@ def generate_charts(data: dict, output_dir: Path):
         ax = axes[0, 0]
         ax.plot(elapsed, gpu_data['temp'], 'r-', linewidth=1.5)
         ax.fill_between(elapsed, gpu_data['temp'], alpha=0.3, color='red')
+        ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Temperature (°C)')
         ax.set_title('Temperature')
         ax.grid(True, alpha=0.3)
         max_temp = max(gpu_data['temp'])
-        ax.axhline(y=max_temp, color='darkred', linestyle='--', alpha=0.5, label=f'Max: {max_temp:.1f}°C')
+        ax.axhline(y=max_temp, color='darkred', linestyle=':', alpha=0.5, label=f'Max: {max_temp:.1f}°C')
         ax.legend()
         
         # GPU 使用率
         ax = axes[0, 1]
         ax.plot(elapsed, gpu_data['gpu_util'], 'g-', linewidth=1.5)
         ax.fill_between(elapsed, gpu_data['gpu_util'], alpha=0.3, color='green')
+        ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Utilization (%)')
         ax.set_title('GPU Utilization')
         ax.set_ylim(0, 105)
         ax.grid(True, alpha=0.3)
+        ax.legend()
         
         # 功耗
         ax = axes[1, 0]
         ax.plot(elapsed, gpu_data['power'], 'orange', linewidth=1.5)
         ax.fill_between(elapsed, gpu_data['power'], alpha=0.3, color='orange')
-        ax.axhline(y=gpu_data['power_limit'], color='red', linestyle='--', alpha=0.5, label=f'Limit: {gpu_data["power_limit"]:.0f}W')
+        ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
+        ax.axhline(y=gpu_data['power_limit'], color='red', linestyle=':', alpha=0.5, label=f'Limit: {gpu_data["power_limit"]:.0f}W')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Power (W)')
         ax.set_title('Power Consumption')
@@ -209,7 +216,8 @@ def generate_charts(data: dict, output_dir: Path):
         total_gb = gpu_data['mem_total'] / 1024
         ax.plot(elapsed, mem_gb, 'b-', linewidth=1.5)
         ax.fill_between(elapsed, mem_gb, alpha=0.3, color='blue')
-        ax.axhline(y=total_gb, color='darkblue', linestyle='--', alpha=0.5, label=f'Total: {total_gb:.1f}GB')
+        ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
+        ax.axhline(y=total_gb, color='darkblue', linestyle=':', alpha=0.5, label=f'Total: {total_gb:.1f}GB')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Memory (GB)')
         ax.set_title('Memory Usage')
@@ -274,6 +282,7 @@ def main():
     data = {
         'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'duration': duration,
+        'total_time': total_time,
         'timestamps': [],
         'elapsed': [],
         'gpus': {}
@@ -297,7 +306,11 @@ def main():
     else:
         burn_cmd = f"gpu_burn {duration}"
     
+    extra_time = 30  # gpu-burn 結束後繼續監控 30 秒
+    total_time = duration + extra_time
+    
     print(f"\n🚀 啟動: {burn_cmd}")
+    print(f"📊 監控時間: {duration}秒 + {extra_time}秒(冷卻) = {total_time}秒")
     burn_queue = Queue()
     burn_thread = Thread(target=run_gpu_burn, args=(duration, burn_queue), daemon=True)
     burn_thread.start()
@@ -307,7 +320,7 @@ def main():
     start_time = time.time()
     
     try:
-        while time.time() - start_time < duration + 5:  # 多等 5 秒確保結束
+        while time.time() - start_time < total_time:
             elapsed = time.time() - start_time
             gpus = get_gpu_stats()
             
@@ -326,9 +339,16 @@ def main():
                 
                 # 顯示狀態
                 g = gpus[0]
-                progress = min(elapsed / duration * 100, 100)
+                progress = min(elapsed / total_time * 100, 100)
                 bar = '█' * int(progress / 5) + '░' * (20 - int(progress / 5))
-                print(f"\r[{bar}] {progress:5.1f}% | "
+                
+                # 顯示階段
+                if elapsed < duration:
+                    phase = "🔥 BURN"
+                else:
+                    phase = "❄️ COOL"
+                
+                print(f"\r[{bar}] {progress:5.1f}% {phase} | "
                       f"Temp: {g['temp']:5.1f}°C | "
                       f"GPU: {g['gpu_util']:5.1f}% | "
                       f"Mem: {g['mem_used']:.0f}MB | "
@@ -339,9 +359,6 @@ def main():
                 msg = burn_queue.get_nowait()
                 if msg is None:
                     break
-            
-            if elapsed >= duration:
-                break
                 
             time.sleep(1)
             
