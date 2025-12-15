@@ -278,6 +278,10 @@ def main():
     output_dir.mkdir(exist_ok=True)
     print(f"輸出目錄: {output_dir}")
     
+    # 計算總監控時間
+    extra_time = 30  # gpu-burn 結束後繼續監控 30 秒
+    total_time = duration + extra_time
+    
     # 初始化資料
     data = {
         'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -305,9 +309,6 @@ def main():
         burn_cmd = f"./gpu_burn {duration}"
     else:
         burn_cmd = f"gpu_burn {duration}"
-    
-    extra_time = 30  # gpu-burn 結束後繼續監控 30 秒
-    total_time = duration + extra_time
     
     print(f"\n🚀 啟動: {burn_cmd}")
     print(f"📊 監控時間: {duration}秒 + {extra_time}秒(冷卻) = {total_time}秒")
