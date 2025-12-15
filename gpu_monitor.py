@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 GPU Burn 測試監控工具
-記錄 GPU 溫度、記憶體、使用率等指標，並產生視覺化圖表
+自動啟動 gpu-burn 並記錄 GPU 溫度、記憶體、使用率等指標，產生視覺化圖表
 
 使用方式:
-    python gpu_monitor.py --duration 300      # 監控 300 秒
-    python gpu_monitor.py --duration 10m      # 監控 10 分鐘
-    python gpu_monitor.py --duration 1h       # 監控 1 小時
+    python gpu_monitor.py --duration 300      # 運行 gpu-burn 並監控 300 秒
+    python gpu_monitor.py --duration 10m      # 運行 gpu-burn 並監控 10 分鐘
+    python gpu_monitor.py --duration 1h       # 運行 gpu-burn 並監控 1 小時
     python gpu_monitor.py --duration 300 --interval 0.5  # 每 0.5 秒取樣一次
+    python gpu_monitor.py --duration 5m --no-burn        # 只監控，不啟動 gpu-burn
+    python gpu_monitor.py --duration 5m --gpu-burn-path /opt/gpu-burn/gpu_burn  # 指定 gpu-burn 路徑
 """
 
 import subprocess
@@ -16,8 +18,11 @@ import argparse
 import csv
 import sys
 import os
+import signal
+import shutil
 from datetime import datetime
 from pathlib import Path
+import threading
 
 try:
     import matplotlib.pyplot as plt
@@ -51,6 +56,126 @@ def check_nvidia_smi() -> bool:
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
+
+
+def find_gpu_burn() -> str:
+    """尋找 gpu-burn 執行檔路徑"""
+    # 常見路徑
+    common_paths = [
+        'gpu_burn',
+        'gpu-burn',
+        '/usr/local/bin/gpu_burn',
+        '/usr/local/bin/gpu-burn',
+        '/opt/gpu-burn/gpu_burn',
+        '/opt/gpu_burn/gpu_burn',
+        './gpu_burn',
+        './gpu-burn',
+    ]
+    
+    # 先檢查 PATH 中是否有
+    for cmd in ['gpu_burn', 'gpu-burn']:
+        path = shutil.which(cmd)
+        if path:
+            return path
+    
+    # 檢查常見路徑
+    for path in common_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    
+    return None
+
+
+def start_gpu_burn(duration: int, gpu_burn_path: str = None, use_sudo: bool = True) -> subprocess.Popen:
+    """啟動 gpu-burn 程序"""
+    if gpu_burn_path is None:
+        gpu_burn_path = find_gpu_burn()
+    
+    if gpu_burn_path is None:
+        print("⚠️  警告: 找不到 gpu-burn，將只進行監控")
+        print("   請確認 gpu-burn 已安裝，或使用 --gpu-burn-path 指定路徑")
+        print("   安裝方式: git clone https://github.com/wilicc/gpu-burn && cd gpu-burn && make")
+        return None
+    
+    # 構建命令
+    cmd = []
+    if use_sudo:
+        cmd.append('sudo')
+    cmd.extend([gpu_burn_path, str(duration)])
+    
+    print(f"🔥 啟動 gpu-burn: {' '.join(cmd)}")
+    
+    try:
+        # 使用 Popen 在背景運行
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            preexec_fn=os.setsid if os.name != 'nt' else None
+        )
+        return process
+    except Exception as e:
+        print(f"⚠️  無法啟動 gpu-burn: {e}")
+        return None
+
+
+def stop_gpu_burn(process: subprocess.Popen):
+    """停止 gpu-burn 程序"""
+    if process is None:
+        return
+    
+    try:
+        # 嘗試優雅地終止進程組
+        if os.name != 'nt':
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        else:
+            process.terminate()
+        
+        # 等待最多 5 秒
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # 強制終止
+            if os.name != 'nt':
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait()
+        
+        print("🛑 gpu-burn 已停止")
+    except Exception as e:
+        print(f"⚠️  停止 gpu-burn 時發生錯誤: {e}")
+
+
+class GpuBurnOutputReader(threading.Thread):
+    """背景讀取 gpu-burn 輸出的執行緒"""
+    def __init__(self, process: subprocess.Popen, output_path: Path):
+        super().__init__(daemon=True)
+        self.process = process
+        self.output_file = output_path / "gpu_burn_output.log"
+        self.lines = []
+        self.running = True
+    
+    def run(self):
+        try:
+            with open(self.output_file, 'w') as f:
+                for line in iter(self.process.stdout.readline, ''):
+                    if not self.running:
+                        break
+                    if line:
+                        self.lines.append(line.strip())
+                        f.write(line)
+                        f.flush()
+        except Exception:
+            pass
+    
+    def stop(self):
+        self.running = False
+    
+    def get_last_lines(self, n: int = 3) -> list:
+        return self.lines[-n:] if self.lines else []
 
 
 def get_gpu_info() -> list[dict]:
@@ -171,8 +296,10 @@ def print_status(gpu: dict, elapsed: int, total: int):
         print(f"\033[K{line}")  # 清除該行並印出
 
 
-def monitor_gpus(duration: int, interval: float = 1.0, output_dir: str = None) -> dict:
-    """監控 GPU 並記錄數據"""
+def monitor_gpus(duration: int, interval: float = 1.0, output_dir: str = None,
+                 run_gpu_burn: bool = True, gpu_burn_path: str = None, 
+                 use_sudo: bool = True) -> dict:
+    """監控 GPU 並記錄數據，可選擇同時運行 gpu-burn"""
     if output_dir is None:
         output_dir = f"gpu_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
@@ -215,6 +342,19 @@ def monitor_gpus(duration: int, interval: float = 1.0, output_dir: str = None) -
     print(f"   持續時間: {format_time(duration)}")
     print(f"   取樣間隔: {interval} 秒")
     print(f"   輸出目錄: {output_path.absolute()}")
+    print(f"   GPU Burn: {'啟用' if run_gpu_burn else '停用'}")
+    
+    # 啟動 gpu-burn
+    gpu_burn_process = None
+    gpu_burn_reader = None
+    
+    if run_gpu_burn:
+        gpu_burn_process = start_gpu_burn(duration, gpu_burn_path, use_sudo)
+        if gpu_burn_process:
+            gpu_burn_reader = GpuBurnOutputReader(gpu_burn_process, output_path)
+            gpu_burn_reader.start()
+            time.sleep(1)  # 給 gpu-burn 一點啟動時間
+    
     print(f"\n🚀 開始監控... (Ctrl+C 可提前結束)\n")
     
     # 預留空間給狀態顯示
@@ -231,6 +371,11 @@ def monitor_gpus(duration: int, interval: float = 1.0, output_dir: str = None) -
             
             if elapsed >= duration:
                 break
+            
+            # 檢查 gpu-burn 是否還在運行
+            if gpu_burn_process and gpu_burn_process.poll() is not None:
+                # gpu-burn 已結束
+                pass
             
             # 取得 GPU 資訊
             gpus = get_gpu_info()
@@ -266,6 +411,12 @@ def monitor_gpus(duration: int, interval: float = 1.0, output_dir: str = None) -
                 
     except KeyboardInterrupt:
         print("\n\n⚠️  監控被使用者中斷")
+    finally:
+        # 停止 gpu-burn
+        if gpu_burn_reader:
+            gpu_burn_reader.stop()
+        if gpu_burn_process:
+            stop_gpu_burn(gpu_burn_process)
     
     actual_duration = time.time() - start_time
     print(f"\n\n✅ 監控完成!")
@@ -278,6 +429,10 @@ def monitor_gpus(duration: int, interval: float = 1.0, output_dir: str = None) -
     # 產生圖表
     if HAS_MATPLOTLIB:
         generate_charts(data, output_path)
+    
+    # 顯示 gpu-burn 最後輸出
+    if gpu_burn_reader and gpu_burn_reader.lines:
+        print(f"\n📝 gpu-burn 輸出已儲存至: {output_path / 'gpu_burn_output.log'}")
     
     return data
 
@@ -529,15 +684,18 @@ def print_summary(data: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='GPU Burn 測試監控工具',
+        description='GPU Burn 測試監控工具 - 自動啟動 gpu-burn 並監控 GPU 狀態',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 範例:
-  %(prog)s --duration 300           # 監控 300 秒
-  %(prog)s --duration 10m           # 監控 10 分鐘
-  %(prog)s --duration 1h            # 監控 1 小時
+  %(prog)s --duration 300           # 運行 gpu-burn 並監控 300 秒
+  %(prog)s --duration 10m           # 運行 gpu-burn 並監控 10 分鐘
+  %(prog)s --duration 1h            # 運行 gpu-burn 並監控 1 小時
   %(prog)s -d 5m -i 0.5             # 每 0.5 秒取樣，持續 5 分鐘
   %(prog)s -d 30m -o my_test        # 結果存到 my_test 目錄
+  %(prog)s -d 10m --no-burn         # 只監控，不啟動 gpu-burn
+  %(prog)s -d 5m --no-sudo          # 不使用 sudo 執行 gpu-burn
+  %(prog)s -d 5m --gpu-burn-path /opt/gpu-burn/gpu_burn  # 指定 gpu-burn 路徑
         """
     )
     
@@ -547,6 +705,12 @@ def main():
                         help='取樣間隔，單位秒 (預設: 1.0)')
     parser.add_argument('-o', '--output', type=str, default=None,
                         help='輸出目錄名稱 (預設: gpu_monitor_YYYYMMDD_HHMMSS)')
+    parser.add_argument('--no-burn', action='store_true',
+                        help='不啟動 gpu-burn，只進行監控')
+    parser.add_argument('--no-sudo', action='store_true',
+                        help='不使用 sudo 執行 gpu-burn')
+    parser.add_argument('--gpu-burn-path', type=str, default=None,
+                        help='指定 gpu-burn 執行檔路徑')
     
     args = parser.parse_args()
     
@@ -575,7 +739,14 @@ def main():
     print("🔥 GPU Burn 測試監控工具")
     print("=" * 70)
     
-    data = monitor_gpus(duration, args.interval, args.output)
+    data = monitor_gpus(
+        duration=duration,
+        interval=args.interval,
+        output_dir=args.output,
+        run_gpu_burn=not args.no_burn,
+        gpu_burn_path=args.gpu_burn_path,
+        use_sudo=not args.no_sudo
+    )
     
     # 印出統計摘要
     print_summary(data)
