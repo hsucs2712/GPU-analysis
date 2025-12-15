@@ -81,7 +81,11 @@ def get_gpu_stats() -> list[dict]:
 
 def run_gpu_burn(duration: int, output_queue: Queue):
     """在背景執行 gpu-burn"""
-    cmd = f"gpu_burn {duration}"
+    # 優先用當前目錄的 ./gpu_burn
+    if os.path.isfile('./gpu_burn') and os.access('./gpu_burn', os.X_OK):
+        cmd = f"./gpu_burn {duration}"
+    else:
+        cmd = f"gpu_burn {duration}"
     try:
         process = subprocess.Popen(
             cmd,
@@ -288,7 +292,12 @@ def main():
         }
     
     # 啟動 gpu-burn
-    print(f"\n🚀 啟動 gpu_burn {duration}...")
+    if os.path.isfile('./gpu_burn') and os.access('./gpu_burn', os.X_OK):
+        burn_cmd = f"./gpu_burn {duration}"
+    else:
+        burn_cmd = f"gpu_burn {duration}"
+    
+    print(f"\n🚀 啟動: {burn_cmd}")
     burn_queue = Queue()
     burn_thread = Thread(target=run_gpu_burn, args=(duration, burn_queue), daemon=True)
     burn_thread.start()
