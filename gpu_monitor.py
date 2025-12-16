@@ -24,8 +24,8 @@ try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
-    HAS_MATPLOTLIB = False
-    print("提示: pip install matplotlib 可產生圖表")
+    subprocess.check_call([sys.excutable, "-m", "pip", "install", "matplotlaib"])
+    HAS_MATPLOTLIB = True
 
 
 def parse_duration(s: str) -> int:
