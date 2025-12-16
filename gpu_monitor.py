@@ -24,8 +24,8 @@ try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
-    subprocess.check_call([sys.excutable, "-m", "pip", "install", "matplotlaib"])
-    HAS_MATPLOTLIB = True
+    HAS_MATPLOTLIB = False
+    print("提示: pip install matplotlib 可產生圖表")
 
 
 def parse_duration(s: str) -> int:
@@ -161,7 +161,24 @@ def generate_report(data: dict, output_dir: Path):
     print(f"📄 報告已儲存: {report_file}")
 
 
-def generate_charts(data: dict, output_dir: Path):
+def downsample(data_list: list, max_points: int = 200) -> tuple[list, list]:
+    """降低取樣率，讓圖表更清晰
+    回傳: (indices, sampled_data)
+    """
+    if len(data_list) <= max_points:
+        return list(range(len(data_list))), data_list
+    
+    step = len(data_list) / max_points
+    indices = [int(i * step) for i in range(max_points)]
+    # 確保最後一個點被包含
+    if indices[-1] != len(data_list) - 1:
+        indices[-1] = len(data_list) - 1
+    
+    sampled = [data_list[i] for i in indices]
+    return indices, sampled
+
+
+def generate_charts(data: dict, output_dir: Path, max_points: int = 200):
     """產生圖表"""
     if not HAS_MATPLOTLIB:
         return
@@ -169,27 +186,36 @@ def generate_charts(data: dict, output_dir: Path):
     elapsed = data['elapsed']
     burn_duration = data['duration']  # gpu-burn 實際運行時間
     
+    # 取樣 elapsed 時間軸
+    indices, elapsed_sampled = downsample(elapsed, max_points)
+    
     for gpu_id, gpu_data in data['gpus'].items():
+        # 取樣各項數據
+        _, temp_sampled = downsample(gpu_data['temp'], max_points)
+        _, util_sampled = downsample(gpu_data['gpu_util'], max_points)
+        _, power_sampled = downsample(gpu_data['power'], max_points)
+        _, mem_sampled = downsample(gpu_data['mem_used'], max_points)
+        
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         fig.suptitle(f"GPU {gpu_id}: {gpu_data['name']}", fontsize=14, fontweight='bold')
         
         # 溫度
         ax = axes[0, 0]
-        ax.plot(elapsed, gpu_data['temp'], 'r-', linewidth=1.5)
-        ax.fill_between(elapsed, gpu_data['temp'], alpha=0.3, color='red')
+        ax.plot(elapsed_sampled, temp_sampled, 'r-', linewidth=1.5)
+        ax.fill_between(elapsed_sampled, temp_sampled, alpha=0.3, color='red')
         ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Temperature (°C)')
         ax.set_title('Temperature')
         ax.grid(True, alpha=0.3)
-        max_temp = max(gpu_data['temp'])
+        max_temp = max(gpu_data['temp'])  # 用完整數據算最大值
         ax.axhline(y=max_temp, color='darkred', linestyle=':', alpha=0.5, label=f'Max: {max_temp:.1f}°C')
         ax.legend()
         
         # GPU 使用率
         ax = axes[0, 1]
-        ax.plot(elapsed, gpu_data['gpu_util'], 'g-', linewidth=1.5)
-        ax.fill_between(elapsed, gpu_data['gpu_util'], alpha=0.3, color='green')
+        ax.plot(elapsed_sampled, util_sampled, 'g-', linewidth=1.5)
+        ax.fill_between(elapsed_sampled, util_sampled, alpha=0.3, color='green')
         ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Utilization (%)')
@@ -200,8 +226,8 @@ def generate_charts(data: dict, output_dir: Path):
         
         # 功耗
         ax = axes[1, 0]
-        ax.plot(elapsed, gpu_data['power'], 'orange', linewidth=1.5)
-        ax.fill_between(elapsed, gpu_data['power'], alpha=0.3, color='orange')
+        ax.plot(elapsed_sampled, power_sampled, 'orange', linewidth=1.5)
+        ax.fill_between(elapsed_sampled, power_sampled, alpha=0.3, color='orange')
         ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
         ax.axhline(y=gpu_data['power_limit'], color='red', linestyle=':', alpha=0.5, label=f'Limit: {gpu_data["power_limit"]:.0f}W')
         ax.set_xlabel('Time (s)')
@@ -212,10 +238,10 @@ def generate_charts(data: dict, output_dir: Path):
         
         # 記憶體
         ax = axes[1, 1]
-        mem_gb = [m / 1024 for m in gpu_data['mem_used']]
+        mem_gb = [m / 1024 for m in mem_sampled]
         total_gb = gpu_data['mem_total'] / 1024
-        ax.plot(elapsed, mem_gb, 'b-', linewidth=1.5)
-        ax.fill_between(elapsed, mem_gb, alpha=0.3, color='blue')
+        ax.plot(elapsed_sampled, mem_gb, 'b-', linewidth=1.5)
+        ax.fill_between(elapsed_sampled, mem_gb, alpha=0.3, color='blue')
         ax.axvline(x=burn_duration, color='gray', linestyle='--', alpha=0.7, label='Burn End')
         ax.axhline(y=total_gb, color='darkblue', linestyle=':', alpha=0.5, label=f'Total: {total_gb:.1f}GB')
         ax.set_xlabel('Time (s)')
@@ -228,7 +254,7 @@ def generate_charts(data: dict, output_dir: Path):
         chart_file = output_dir / f"gpu_{gpu_id}_chart.png"
         plt.savefig(chart_file, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"📊 圖表已儲存: {chart_file}")
+        print(f"📊 圖表已儲存: {chart_file} (取樣: {len(elapsed_sampled)}/{len(elapsed)} 點)")
 
 
 def save_csv(data: dict, output_dir: Path):
@@ -345,9 +371,9 @@ def main():
                 
                 # 顯示階段
                 if elapsed < duration:
-                    phase = "🔥 BURN"
+                    phase = "🔥"
                 else:
-                    phase = "❄️ COOL"
+                    phase = "❄️"
                 
                 print(f"\r[{bar}] {progress:5.1f}% {phase} | "
                       f"Temp: {g['temp']:5.1f}°C | "
